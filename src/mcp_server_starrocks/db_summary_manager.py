@@ -15,8 +15,10 @@
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
+
+from .db_client import format_qualified_identifiers
 
 
 @dataclass
@@ -97,8 +99,45 @@ class DatabaseSummaryManager:
         # Database last sync time: {database: timestamp}
         self.db_last_sync: Dict[str, float] = {}
     
+    def _merge_table_list_into_cache(self, database: str, current_time: float, current_tables: Dict[str, Dict[str, Any]]) -> None:
+        """Apply parsed table list to table_cache and db_last_sync."""
+        # Update cache: add new tables, update existing, remove dropped
+        cache_keys_for_db = {key[1]: key for key in self.table_cache.keys() if key[0] == database}
+
+        # Add or update existing tables
+        for table_name, table_data in current_tables.items():
+            cache_key = (database, table_name)
+
+            if cache_key in self.table_cache:
+                # Update existing table info
+                table_info = self.table_cache[cache_key]
+                table_info.size_str = table_data['size_str']
+                table_info.size_bytes = table_data['size_bytes']
+                table_info.replica_count = table_data['replica_count']
+                table_info.last_updated = current_time
+            else:
+                # Create new table info
+                self.table_cache[cache_key] = TableInfo(
+                    name=table_name,
+                    database=database,
+                    size_str=table_data['size_str'],
+                    size_bytes=table_data['size_bytes'],
+                    replica_count=table_data['replica_count'],
+                    last_updated=current_time
+                )
+
+        # Remove dropped tables
+        for table_name in cache_keys_for_db:
+            if table_name not in current_tables:
+                cache_key = cache_keys_for_db[table_name]
+                del self.table_cache[cache_key]
+                logger.debug(f"Removed dropped table {database}.{table_name} from cache")
+
+        self.db_last_sync[database] = current_time
+        logger.debug(f"Synced {len(current_tables)} tables for database {database}")
+
     def _sync_table_list(self, database: str, force: bool = False) -> bool:
-        """Sync table list using SHOW DATA, detect new/dropped tables"""
+        """Sync table list using SHOW DATA, or SHOW TABLES for JDBC/external DBs where SHOW DATA fails."""
         current_time = time.time()
         
         # Check if sync is needed (2min expiration or force)
@@ -109,73 +148,64 @@ class DatabaseSummaryManager:
         logger.debug(f"Syncing table list for database {database}")
         
         try:
-            # Execute SHOW DATA to get current table list with sizes
             result = self.db_client.execute("SHOW DATA", db=database)
-            if not result.success:
-                logger.error(f"Failed to sync table list for {database}: {result.error_message}")
-                return False
-            
-            if not result.rows:
-                logger.info(f"No tables found in database {database}")
-                # Clear cache for this database
-                keys_to_remove = [key for key in self.table_cache.keys() if key[0] == database]
-                for key in keys_to_remove:
-                    del self.table_cache[key]
-                self.db_last_sync[database] = current_time
-                return True
-            
-            # Parse current tables from SHOW DATA
-            current_tables = {}
-            for row in result.rows:
-                table_name = row[0]
-                # Skip summary rows (Total, Quota, Left)
-                if table_name.lower() in ['total', 'quota', 'left']:
-                    continue
-                    
-                size_str = row[1] if len(row) > 1 else ""
-                replica_count = int(row[2]) if len(row) > 2 and str(row[2]).isdigit() else 0
-                
-                size_bytes = TableInfo.parse_size_string(size_str)
-                current_tables[table_name] = {
-                    'size_str': size_str,
-                    'size_bytes': size_bytes,
-                    'replica_count': replica_count
-                }
-            
-            # Update cache: add new tables, update existing, remove dropped
-            cache_keys_for_db = {key[1]: key for key in self.table_cache.keys() if key[0] == database}
-            
-            # Add or update existing tables
-            for table_name, table_data in current_tables.items():
-                cache_key = (database, table_name)
-                
-                if cache_key in self.table_cache:
-                    # Update existing table info
-                    table_info = self.table_cache[cache_key]
-                    table_info.size_str = table_data['size_str']
-                    table_info.size_bytes = table_data['size_bytes']
-                    table_info.replica_count = table_data['replica_count']
-                    table_info.last_updated = current_time
-                else:
-                    # Create new table info
-                    self.table_cache[cache_key] = TableInfo(
-                        name=table_name,
-                        database=database,
-                        size_str=table_data['size_str'],
-                        size_bytes=table_data['size_bytes'],
-                        replica_count=table_data['replica_count'],
-                        last_updated=current_time
-                    )
-            
-            # Remove dropped tables
-            for table_name in cache_keys_for_db:
-                if table_name not in current_tables:
-                    cache_key = cache_keys_for_db[table_name]
-                    del self.table_cache[cache_key]
-                    logger.debug(f"Removed dropped table {database}.{table_name} from cache")
-            
-            self.db_last_sync[database] = current_time
-            logger.debug(f"Synced {len(current_tables)} tables for database {database}")
+            current_tables: Dict[str, Dict[str, Any]] = {}
+
+            if result.success:
+                if not result.rows:
+                    logger.info(f"No tables found in database {database}")
+                    keys_to_remove = [key for key in self.table_cache.keys() if key[0] == database]
+                    for key in keys_to_remove:
+                        del self.table_cache[key]
+                    self.db_last_sync[database] = current_time
+                    return True
+
+                for row in result.rows:
+                    table_name = row[0]
+                    if table_name.lower() in ['total', 'quota', 'left']:
+                        continue
+
+                    size_str = row[1] if len(row) > 1 else ""
+                    replica_count = int(row[2]) if len(row) > 2 and str(row[2]).isdigit() else 0
+
+                    size_bytes = TableInfo.parse_size_string(size_str)
+                    current_tables[table_name] = {
+                        'size_str': size_str,
+                        'size_bytes': size_bytes,
+                        'replica_count': replica_count
+                    }
+            else:
+                logger.warning(
+                    f"SHOW DATA failed for {database}: {result.error_message}; "
+                    f"falling back to SHOW TABLES FROM"
+                )
+                try:
+                    ref = format_qualified_identifiers(database)
+                except ValueError as ve:
+                    logger.error(f"Invalid database qualifier {database!r}: {ve}")
+                    return False
+                fb = self.db_client.execute(f"SHOW TABLES FROM {ref}", db=database)
+                if not fb.success:
+                    logger.error(f"Failed to sync table list for {database}: {fb.error_message}")
+                    return False
+                if not fb.rows:
+                    logger.info(f"No tables found in database {database} (SHOW TABLES)")
+                    keys_to_remove = [key for key in self.table_cache.keys() if key[0] == database]
+                    for key in keys_to_remove:
+                        del self.table_cache[key]
+                    self.db_last_sync[database] = current_time
+                    return True
+                for row in fb.rows:
+                    table_name = row[0]
+                    if not table_name or str(table_name).lower() in ['total', 'quota', 'left']:
+                        continue
+                    current_tables[str(table_name)] = {
+                        'size_str': '',
+                        'size_bytes': 0,
+                        'replica_count': 0,
+                    }
+
+            self._merge_table_list_into_cache(database, current_time, current_tables)
             return True
             
         except Exception as e:
@@ -192,15 +222,16 @@ class DatabaseSummaryManager:
         try:
             # Build query to get column information for all tables
             table_names_quoted = "', '".join(tables)
+            isc_schema = database.split(".", 1)[1] if "." in database else database
             query = f"""
             SELECT table_name, column_name, ordinal_position, column_type 
             FROM information_schema.columns 
-            WHERE table_schema = '{database}' 
+            WHERE table_schema = '{isc_schema}' 
             AND table_name IN ('{table_names_quoted}')
             ORDER BY table_name, ordinal_position
             """
             
-            result = self.db_client.execute(query)
+            result = self.db_client.execute(query, db=database)
             if not result.success:
                 logger.error(f"Failed to fetch column info: {result.error_message}")
                 return {}
@@ -232,7 +263,8 @@ class DatabaseSummaryManager:
     def _fetch_create_statement(self, database: str, table: str) -> Optional[str]:
         """Fetch CREATE TABLE statement for large tables"""
         try:
-            result = self.db_client.execute(f"SHOW CREATE TABLE `{database}`.`{table}`")
+            full_ref = format_qualified_identifiers(f"{database}.{table}")
+            result = self.db_client.execute(f"SHOW CREATE TABLE {full_ref}", db=database)
             if result.success and result.rows and len(result.rows[0]) > 1:
                 return result.rows[0][1]  # Second column contains CREATE statement
         except Exception as e:
@@ -286,6 +318,56 @@ class DatabaseSummaryManager:
         
         # Generate summary output
         return self._format_database_summary(database, tables_info, limit)
+
+    def get_catalog_summary(
+        self,
+        catalog: str,
+        *,
+        limit_per_database: int = 10000,
+        max_databases: int = 40,
+        refresh: bool = False,
+    ) -> str:
+        """
+        List databases in a catalog (SHOW DATABASES FROM) and run get_database_summary
+        for each as catalog.database (best-effort; failures are inlined per database).
+        """
+        if not catalog or not catalog.strip():
+            return "Error: catalog name is required."
+        catalog = catalog.strip()
+        try:
+            cat_sql = format_qualified_identifiers(catalog)
+        except ValueError as ve:
+            return f"Error: invalid catalog name: {ve}"
+
+        list_result = self.db_client.execute(f"SHOW DATABASES FROM {cat_sql}")
+        if not list_result.success:
+            return f"Error listing databases in catalog '{catalog}': {list_result.error_message}"
+
+        databases = [row[0] for row in (list_result.rows or [])]
+        lines = [
+            "Tip: run read_query('SHOW CATALOGS') first, then catalog_summary(catalog=...) for each catalog.",
+            f"=== Catalog summary: `{catalog}` ({len(databases)} databases) ===",
+        ]
+        if len(databases) > max_databases:
+            lines.append(
+                f"Note: only the first {max_databases} of {len(databases)} databases are included (max_databases)."
+            )
+            databases = databases[:max_databases]
+
+        blocks: List[str] = ["\n".join(lines)]
+        for db in databases:
+            qualified = f"{catalog}.{db}"
+            blocks.append(f"--- Database `{qualified}` ---")
+            try:
+                summary = self.get_database_summary(
+                    qualified, limit=limit_per_database, refresh=refresh
+                )
+                blocks.append(summary)
+            except Exception as e:
+                logger.exception(f"catalog_summary failed for {qualified}")
+                blocks.append(f"Error summarizing `{qualified}`: {type(e).__name__}: {e}")
+
+        return "\n\n".join(blocks)
     
     def _format_database_summary(self, database: str, tables_info: List[TableInfo], limit: int) -> str:
         """Format database summary with intelligent truncation"""

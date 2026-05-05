@@ -34,7 +34,15 @@ import plotly.graph_objs
 from loguru import logger
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware import Middleware
-from .db_client import get_db_client, reset_db_connections, ResultSet, PerfAnalysisInput
+
+from .mcp_request_responder_patch import apply_mcp_request_responder_duplicate_guard
+from .db_client import (
+    get_db_client,
+    reset_db_connections,
+    ResultSet,
+    PerfAnalysisInput,
+    format_qualified_identifiers,
+)
 from .db_summary_manager import get_db_summary_manager
 from .connection_health_checker import (
     initialize_health_checker,
@@ -48,19 +56,26 @@ logger.remove()  # Remove default handler
 logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "INFO"), 
           format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{function}:{line} | {message}")
 
+apply_mcp_request_responder_duplicate_guard()
+
 mcp = FastMCP('mcp-server-starrocks')
 
 # a hint for soft limit, not enforced
 overview_length_limit = int(os.getenv('STARROCKS_OVERVIEW_LIMIT', str(20000)))
-# Global cache for table overviews: {(db_name, table_name): overview_string}
+# Global cache for table overviews: {(catalog, database, table): overview_string}; catalog may be ""
 global_table_overview_cache = {}
 
 # Get database client instance
 db_client = get_db_client()
 # Get database summary manager instance
 db_summary_manager = get_db_summary_manager(db_client)
-# Description suffix for tools, if default db is set
-description_suffix = f". db session already in default db `{db_client.default_database}`" if db_client.default_database else ""
+# Description suffix for tools, if default session namespace is set (database or catalog.database)
+_default_sess = db_client.default_database
+description_suffix = (
+    f". Session default namespace is `{_default_sess}` (StarRocks USE: database or catalog.database); prefer fully qualified table names `catalog.database.table` when exploring multiple catalogs."
+    if _default_sess
+    else ""
+)
 
 # Initialize connection health checker
 _health_checker = initialize_health_checker(db_client)
@@ -122,29 +137,65 @@ def get_system_internal_information(path: str) -> str:
     return db_client.execute(f"show proc '{path}'").to_string(limit=overview_length_limit)
 
 
-def _get_table_details(db_name, table_name, limit=None):
+def _parse_table_overview_arg(table_arg: str, default_database: str | None):
+    """
+    Returns (catalog, database, table_name, session_namespace) or (None, None, None, error_message).
+    catalog is None when only database.table (internal/default_catalog) semantics.
+    """
+    parts = [p for p in table_arg.strip().split(".") if p]
+    if len(parts) >= 4:
+        return None, None, None, (
+            "Error: Too many dot-separated segments. Use `catalog.database.table` (three) or "
+            "`database.table` (two), or a single table name with a session default of `catalog.database`."
+        )
+    if len(parts) == 3:
+        c, d, t = parts[0], parts[1], parts[2]
+        return c, d, t, f"{c}.{d}"
+    if len(parts) == 2:
+        d, t = parts[0], parts[1]
+        return None, d, t, d
+    if len(parts) == 1:
+        t = parts[0]
+        if not default_database:
+            return None, None, None, (
+                f"Error: Table name '{t}' only — set session default (e.g. STARROCKS_DB=catalog.database) "
+                "or use database.table / catalog.database.table."
+            )
+        gd = [p for p in default_database.strip().split(".") if p]
+        if len(gd) == 2:
+            c, d = gd[0], gd[1]
+            return c, d, t, f"{c}.{d}"
+        if len(gd) == 1:
+            d = gd[0]
+            return None, d, t, d
+        return None, None, None, "Error: STARROCKS_DB / default namespace must be `database` or `catalog.database`."
+    return None, None, None, "Error: Missing table name."
+
+
+def _get_table_details(catalog: str | None, database: str, table_name: str, limit=None):
     """
     Helper function to get description, sample rows, and count for a table.
+    catalog+database+table for three-part names; catalog None means database.table only.
     Returns a formatted string. Handles DB errors internally and returns error messages.
     """
     global global_table_overview_cache
-    logger.debug(f"Fetching table details for {db_name}.{table_name}")
+    session_ns = f"{catalog}.{database}" if catalog else database
+    segs = [catalog, database, table_name] if catalog else [database, table_name]
+    full_table_name = ".".join(f"`{s}`" for s in segs)
+    logger.debug(f"Fetching table details for {full_table_name} (session={session_ns})")
     output_lines = []
 
-    full_table_name = f"`{table_name}`"
-    if db_name:
-        full_table_name = f"`{db_name}`.`{table_name}`"
-    else:
+    if not database or not table_name:
         output_lines.append(
-            f"Warning: Database name missing for table '{table_name}'. Using potentially incorrect context.")
-        logger.warning(f"Database name missing for table '{table_name}'")
+            f"Warning: Incomplete table reference for '{table_name}'. Using potentially incorrect context.")
+        logger.warning(f"Incomplete table reference catalog={catalog} database={database} table={table_name}")
 
     count = 0
     output_lines.append(f"--- Overview for {full_table_name} ---")
 
     # 1. Get Row Count
     query = f"SELECT COUNT(*) FROM {full_table_name}"
-    count_result = db_client.execute(query, db=db_name)
+    count_result = db_client.execute(query, db=session_ns)
     if count_result.success and count_result.rows:
         count = count_result.rows[0][0]
         output_lines.append(f"\nTotal rows: {count}")
@@ -158,7 +209,7 @@ def _get_table_details(db_name, table_name, limit=None):
     # 2. Get Columns (DESCRIBE)
     if count > 0:
         query = f"DESCRIBE {full_table_name}"
-        desc_result = db_client.execute(query, db=db_name)
+        desc_result = db_client.execute(query, db=session_ns)
         if desc_result.success and desc_result.column_names and desc_result.rows:
             output_lines.append(f"\nColumns:")
             output_lines.append(desc_result.to_string(limit=limit))
@@ -170,7 +221,7 @@ def _get_table_details(db_name, table_name, limit=None):
 
         # 3. Get Sample Rows (LIMIT 3)
         query = f"SELECT * FROM {full_table_name} LIMIT 3"
-        sample_result = db_client.execute(query, db=db_name)
+        sample_result = db_client.execute(query, db=session_ns)
         if sample_result.success and sample_result.column_names and sample_result.rows:
             output_lines.append(f"\nSample rows (limit 3):")
             output_lines.append(sample_result.to_string(limit=limit))
@@ -181,7 +232,7 @@ def _get_table_details(db_name, table_name, limit=None):
 
     overview_string = "\n".join(output_lines)
     # Update cache even if there were partial errors, so we cache the error message too
-    cache_key = (db_name, table_name)
+    cache_key = (catalog or "", database, table_name)
     global_table_overview_cache[cache_key] = overview_string
     return overview_string
 
@@ -190,7 +241,8 @@ def _get_table_details(db_name, table_name, limit=None):
 
 @mcp.tool(description="Execute a SELECT query or commands that return a ResultSet" + description_suffix)
 def read_query(query: Annotated[str, Field(description="SQL query to execute")],
-               db: Annotated[str|None, Field(description="database")] = None) -> ToolResult:
+               db: Annotated[str|None, Field(
+                   description="Optional session namespace for StarRocks USE: `database` or `catalog.database` (overrides STARROCKS_DB).")] = None) -> ToolResult:
     # return csv like result set, with column names as first row
     logger.info(f"Executing read query: {query[:100]}{'...' if len(query) > 100 else ''}")
     result = db_client.execute(query, db=db)
@@ -204,7 +256,8 @@ def read_query(query: Annotated[str, Field(description="SQL query to execute")],
 
 @mcp.tool(description="Execute a DDL/DML or other StarRocks command that do not have a ResultSet" + description_suffix)
 def write_query(query: Annotated[str, Field(description="SQL to execute")],
-                db: Annotated[str|None, Field(description="database")] = None) -> ToolResult:
+                db: Annotated[str|None, Field(
+                    description="Optional session namespace: `database` or `catalog.database` (StarRocks USE).")] = None) -> ToolResult:
     logger.info(f"Executing write query: {query[:100]}{'...' if len(query) > 100 else ''}")
     result = db_client.execute(query, db=db)
     if not result.success:
@@ -221,7 +274,8 @@ def analyze_query(
         uuid: Annotated[
             str|None, Field(description="Query ID, a string composed of 32 hexadecimal digits formatted as 8-4-4-4-12")]=None,
         sql: Annotated[str|None, Field(description="Query SQL")]=None,
-        db: Annotated[str|None, Field(description="database")] = None
+        db: Annotated[str|None, Field(
+            description="Optional session namespace: `database` or `catalog.database`.")] = None
 ) -> str:
     if uuid:
         logger.info(f"Analyzing query profile for UUID: {uuid}")
@@ -237,7 +291,8 @@ def analyze_query(
 @mcp.tool(description="Run a query to get it's query dump and profile, output very large, need special tools to do further processing")
 def collect_query_dump_and_profile(
         query: Annotated[str, Field(description="query to execute")],
-        db: Annotated[str|None, Field(description="database")] = None
+        db: Annotated[str|None, Field(
+            description="Optional session namespace: `database` or `catalog.database`.")] = None
 ) -> ToolResult:
     logger.info(f"Collecting query dump and profile for query: {query[:100]}{'...' if len(query) > 100 else ''}")
     result : PerfAnalysisInput = db_client.collect_perf_analysis_input(query, db=db)
@@ -327,7 +382,8 @@ def query_and_plotly_chart(
         plotly_expr: Annotated[
             str, Field(description="a one function call expression, with 2 vars binded: `px` as `import plotly.express as px`, and `df` as dataframe generated by query `plotly_expr` example: `px.scatter(df, x=\"sepal_width\", y=\"sepal_length\", color=\"species\", marginal_y=\"violin\", marginal_x=\"box\", trendline=\"ols\", template=\"simple_white\")`")],
         format: Annotated[str, Field(description="chart output format, json|png|jpeg")] = "jpeg",
-        db: Annotated[str|None, Field(description="database")] = None
+        db: Annotated[str|None, Field(
+            description="Optional session namespace: `database` or `catalog.database`.")] = None
 ) -> ToolResult:
     """
     Executes an SQL query, creates a Pandas DataFrame, generates a Plotly chart
@@ -340,7 +396,7 @@ def query_and_plotly_chart(
                      and 'df' (the DataFrame from the query) to generate a figure.
                      Example: "px.scatter(df, x='col1', y='col2')"
         format: chat output format, json|png|jpeg, default is jpeg
-        db: Optional database name to execute the query in.
+        db: Optional session namespace (`database` or `catalog.database`) for StarRocks USE before the query.
 
     Returns:
         A list containing types.TextContent and types.ImageContent,
@@ -406,7 +462,7 @@ def query_and_plotly_chart(
 @mcp.tool(description="Get an overview of a specific table: columns, sample rows (up to 3), and total row count. Uses cache unless refresh=true" + description_suffix)
 def table_overview(
         table: Annotated[str, Field(
-            description="Table name, optionally prefixed with database name (e.g., 'db_name.table_name'). If database is omitted, uses the default database.")],
+            description="Table: `table`, `database.table`, or `catalog.database.table`. Single name requires session default STARROCKS_DB=`catalog.database` or `database`. Prefer fully qualified three-part names in multi-catalog clusters.")],
         refresh: Annotated[
             bool, Field(description="Set to true to force refresh, ignoring cache. Defaults to false.")] = False
 ) -> str:
@@ -416,33 +472,20 @@ def table_overview(
             logger.error("Table overview called without table name")
             return "Error: Missing 'table' argument."
 
-        # Parse table argument: [db.]<table>
-        parts = table.split('.', 1)
-        db_name = None
-        table_name = None
-        if len(parts) == 2:
-            db_name, table_name = parts[0], parts[1]
-        elif len(parts) == 1:
-            table_name = parts[0]
-            db_name = db_client.default_database  # Use default if only table name is given
+        catalog, database, table_name, last = _parse_table_overview_arg(table, db_client.default_database)
+        if database is None or table_name is None:
+            return last
 
-        if not table_name:  # Should not happen if table_arg exists, but check
-            logger.error(f"Invalid table name format: {table}")
-            return f"Error: Invalid table name format '{table}'."
-        if not db_name:
-            logger.error(f"No database specified for table {table_name}")
-            return f"Error: Database name not specified for table '{table_name}' and no default database is set."
-
-        cache_key = (db_name, table_name)
+        cache_key = (catalog or "", database, table_name)
 
         # Check cache
         if not refresh and cache_key in global_table_overview_cache:
-            logger.debug(f"Using cached overview for {db_name}.{table_name}")
+            logger.debug(f"Using cached overview for {cache_key}")
             return global_table_overview_cache[cache_key]
 
-        logger.debug(f"Fetching fresh overview for {db_name}.{table_name}")
+        logger.debug(f"Fetching fresh overview for {cache_key}")
         # Fetch details (will also update cache)
-        overview_text = _get_table_details(db_name, table_name, limit=overview_length_limit)
+        overview_text = _get_table_details(catalog, database, table_name, limit=overview_length_limit)
         return overview_text
     except Exception as e:
         # Reset connections on unexpected errors
@@ -466,8 +509,12 @@ def db_overview(
             logger.error("Database overview called without database name")
             return "Error: Database name not provided and no default database is set."
 
-        # List tables in the database
-        query = f"SHOW TABLES FROM `{db_name}`"
+        # List tables in the database (db_name may be catalog.database)
+        try:
+            from_part = format_qualified_identifiers(db_name)
+        except ValueError as ve:
+            return f"Error: invalid database / namespace '{db_name}': {ve}"
+        query = f"SHOW TABLES FROM {from_part}"
         result = db_client.execute(query, db=db_name)
 
         if not result.success:
@@ -484,18 +531,23 @@ def db_overview(
 
         total_length = 0
         limit_per_table = overview_length_limit * (math.log10(len(tables)) + 1) // len(tables)  # Limit per table
+        if "." in db_name:
+            cat_ns, db_only = db_name.split(".", 1)
+        else:
+            cat_ns, db_only = None, db_name
+
         for table_name in tables:
-            cache_key = (db_name, table_name)
+            cache_key = (cat_ns or "", db_only, table_name)
             overview_text = None
 
             # Check cache first
             if not refresh and cache_key in global_table_overview_cache:
-                logger.debug(f"Using cached overview for {db_name}.{table_name}")
+                logger.debug(f"Using cached overview for {cache_key}")
                 overview_text = global_table_overview_cache[cache_key]
             else:
-                logger.debug(f"Fetching fresh overview for {db_name}.{table_name}")
+                logger.debug(f"Fetching fresh overview for {cache_key}")
                 # Fetch details for this table (will update cache via _get_table_details)
-                overview_text = _get_table_details(db_name, table_name, limit=limit_per_table)
+                overview_text = _get_table_details(cat_ns, db_only, table_name, limit=limit_per_table)
 
             all_overviews.append(overview_text)
             all_overviews.append("\n")  # Add separator
@@ -515,7 +567,7 @@ def db_overview(
 @mcp.tool(description="Quickly get summary of a database with tables' schema and size information" + description_suffix)
 def db_summary(
         db: Annotated[str|None, Field(
-            description="Database name. Optional: uses current database by default.")] = None,
+            description="Session namespace: `database` or `catalog.database` (same as StarRocks USE). Optional: uses STARROCKS_DB default when set.")] = None,
         limit: Annotated[int, Field(
             description="Output length limit in characters. Defaults to 10000. Higher values show more tables and details.")] = 10000,
         refresh: Annotated[bool, Field(
@@ -540,6 +592,46 @@ def db_summary(
         reset_db_connections()
         stack_trace = traceback.format_exc()
         return f"Unexpected Error executing tool 'db_summary': {type(e).__name__}: {e}\nStack Trace:\n{stack_trace}"
+
+
+@mcp.tool(
+    description="Summarize all databases in one catalog (SHOW DATABASES FROM, then db_summary-style detail per database). "
+    "Use after read_query('SHOW CATALOGS'). For a single database only, prefer db_summary(db='catalog.database')."
+    + description_suffix
+)
+def catalog_summary(
+        catalog: Annotated[str | None, Field(
+            description="Catalog name (e.g. default_catalog, JDBC catalog). If omitted, uses STARROCKS_CATALOG or the catalog part of STARROCKS_DB=catalog.database when set.")] = None,
+        limit_per_database: Annotated[int, Field(
+            description="Character limit passed to each db_summary (default 10000).")] = 10000,
+        max_databases: Annotated[int, Field(
+            description="Cap how many databases to process (default 40) to avoid huge responses.")] = 40,
+        refresh: Annotated[bool, Field(
+            description="Set true to bypass caches when summarizing each database.")] = False,
+) -> str:
+    try:
+        cat = (catalog or "").strip()
+        if not cat:
+            cat = os.getenv("STARROCKS_CATALOG", "").strip()
+        if not cat and db_client.default_database and "." in db_client.default_database:
+            cat = db_client.default_database.split(".", 1)[0]
+        if not cat:
+            return (
+                "Error: catalog not specified. Pass catalog=..., or set STARROCKS_CATALOG, "
+                "or STARROCKS_DB=catalog.database for inference."
+            )
+        logger.info(f"Getting catalog summary for: {cat}, limit_per_database={limit_per_database}, max_databases={max_databases}")
+        return db_summary_manager.get_catalog_summary(
+            cat,
+            limit_per_database=limit_per_database,
+            max_databases=max_databases,
+            refresh=refresh,
+        )
+    except Exception as e:
+        logger.exception(f"Unexpected error in catalog_summary for catalog={catalog!r}")
+        reset_db_connections()
+        stack_trace = traceback.format_exc()
+        return f"Unexpected Error executing tool 'catalog_summary': {type(e).__name__}: {e}\nStack Trace:\n{stack_trace}"
 
 
 async def main():

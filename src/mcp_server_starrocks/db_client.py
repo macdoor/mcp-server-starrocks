@@ -97,6 +97,35 @@ class PerfAnalysisInput(TypedDict):
     analyze_profile: NotRequired[Optional[str]]
 
 
+_NAMESPACE_SEGMENT = re.compile(r"^[\w-]+$")
+
+
+def format_use_statement(namespace: str) -> str:
+    """
+    Build USE `seg1`.`seg2`... for StarRocks USE [<catalog_name>.]<db_name>.
+    Each dot-separated segment is quoted separately.
+    """
+    if not namespace or not namespace.strip():
+        raise ValueError("Empty session namespace for USE")
+    parts = namespace.strip().split(".")
+    for p in parts:
+        if not p or not _NAMESPACE_SEGMENT.match(p):
+            raise ValueError(f"Invalid namespace segment in {namespace!r}: {p!r}")
+    quoted = ".".join(f"`{p}`" for p in parts)
+    return f"USE {quoted}"
+
+
+def format_qualified_identifiers(qualified: str) -> str:
+    """Return `a`.`b` for use in SQL (e.g. SHOW TABLES FROM). Same segment rules as format_use_statement."""
+    if not qualified or not qualified.strip():
+        raise ValueError("Empty qualified name")
+    parts = qualified.strip().split(".")
+    for p in parts:
+        if not p or not _NAMESPACE_SEGMENT.match(p):
+            raise ValueError(f"Invalid qualified name segment in {qualified!r}: {p!r}")
+    return ".".join(f"`{p}`" for p in parts)
+
+
 def parse_connection_url(connection_url: str) -> dict:
     """
     Parse connection URL into dict with user, password, host, port, database.
@@ -114,7 +143,7 @@ def parse_connection_url(connection_url: str) -> dict:
         r'(?::(?P<password>[^@]*))?'            # Optional :password (can be empty)
         r'@(?P<host>[^:/]+)'                    # Required @host 
         r'(?::(?P<port>\d+))?'                  # Optional :port
-        r'(?:/(?P<database>[\w-]+))?$'          # Optional /database
+        r'(?:/(?P<database>[\w.-]+))?$'         # Optional /database (catalog.database allowed)
     )
     
     match = pattern.match(connection_url)
@@ -162,12 +191,16 @@ class DBClient:
             # Convert port to integer for mysql.connector
             self.connection_params['port'] = int(self.connection_params['port'])
         else:
+            db_raw = os.getenv('STARROCKS_DB', None)
+            catalog_env = os.getenv('STARROCKS_CATALOG', '').strip()
+            if catalog_env and db_raw and '.' not in db_raw:
+                db_raw = f"{catalog_env}.{db_raw}"
             self.connection_params = {
                 'host': os.getenv('STARROCKS_HOST', 'localhost'),
                 'port': int(os.getenv('STARROCKS_PORT', '9030')),
                 'user': os.getenv('STARROCKS_USER', 'root'),
                 'password': os.getenv('STARROCKS_PASSWORD', ''),
-                'database': os.getenv('STARROCKS_DB', None),
+                'database': db_raw,
             }
         self.connection_params.update(**{
             'auth_plugin': os.getenv('STARROCKS_MYSQL_AUTH_PLUGIN', 'mysql_native_password'),
@@ -180,6 +213,12 @@ class DBClient:
             'use_pure': os.getenv('STARROCKS_USE_PURE', 'false').lower() in ('true', '1', 'yes'),
         })
         self.default_database = self.connection_params.get('database')
+        if os.getenv('STARROCKS_URL'):
+            cat_url = os.getenv('STARROCKS_CATALOG', '').strip()
+            db_from_url = self.connection_params.get('database')
+            if cat_url and db_from_url and '.' not in str(db_from_url):
+                self.connection_params['database'] = f"{cat_url}.{db_from_url}"
+                self.default_database = self.connection_params['database']
 
         # MySQL connection pool
         self._connection_pool = None
@@ -191,7 +230,12 @@ class DBClient:
         """Get or create a connection pool for MySQL connections."""
         if self._connection_pool is None:
             try:
-                self._connection_pool = mysql.connector.pooling.MySQLConnectionPool(**self.connection_params)
+                pool_params = dict(self.connection_params)
+                d = pool_params.get('database')
+                if d and '.' in str(d):
+                    # mysql.connector treats database= as a single catalog name; dotted session uses USE after connect
+                    pool_params['database'] = None
+                self._connection_pool = mysql.connector.pooling.MySQLConnectionPool(**pool_params)
             except MySQLError as conn_err:
                 raise conn_err
         
@@ -245,7 +289,7 @@ class DBClient:
             if self.default_database:
                 try:
                     cursor = connection.cursor()
-                    cursor.execute(f"USE {self.default_database}")
+                    cursor.execute(format_use_statement(self.default_database))
                     cursor.close()
                 except adbcError as db_err:
                     print(f"Warning: Could not switch to default database '{self.default_database}': {db_err}")
@@ -413,6 +457,31 @@ class DBClient:
                 except:
                     pass
 
+    def _apply_session_namespace(self, conn, db: Optional[str]) -> Optional[ResultSet]:
+        """Run USE for effective session (db override or default). Returns ResultSet on failure."""
+        effective = db if db is not None else self.default_database
+        if not effective:
+            return None
+        try:
+            use_sql = format_use_statement(effective)
+        except ValueError as ve:
+            return ResultSet(
+                success=False,
+                error_message=f"Invalid session namespace {effective!r}: {ve}",
+                execution_time=0.0,
+            )
+        cursor_temp = conn.cursor()
+        try:
+            cursor_temp.execute(use_sql)
+        except (MySQLError, adbcError) as db_err:
+            return ResultSet(
+                success=False,
+                error_message=f"Error switching to namespace '{effective}': {str(db_err)}",
+                execution_time=0.0,
+            )
+        finally:
+            cursor_temp.close()
+        return None
 
     def execute(
         self, 
@@ -448,32 +517,25 @@ class DBClient:
                 pandas=pandas_df
             )
         conn = None
+        start_time = time.time()
         try:
             conn = self._get_connection()
-            # Switch database if specified
-            if db and db != self.default_database:
-                cursor_temp = conn.cursor()
-                try:
-                    cursor_temp.execute(f"USE `{db}`")
-                except (MySQLError, adbcError) as db_err:
-                    cursor_temp.close()
-                    return ResultSet(
-                        success=False,
-                        error_message=f"Error switching to database '{db}': {str(db_err)}",
-                        execution_time=0
-                    )
-                cursor_temp.close()
+            use_err = self._apply_session_namespace(conn, db)
+            if use_err is not None:
+                return use_err
             return self._execute(conn, statement, None, return_format)
         except (MySQLError, adbcError) as e:
             self._handle_db_error(e)
             return ResultSet(
                 success=False,
                 error_message=f"Error executing statement '{statement}': {str(e)}",
+                execution_time=time.time() - start_time,
             )
         except Exception as e:
             return ResultSet(
                 success=False,
                 error_message=f"Unexpected error executing statement '{statement}': {str(e)}",
+                execution_time=time.time() - start_time,
             )
         finally:
             if conn and not self.enable_arrow_flight_sql:
@@ -486,15 +548,9 @@ class DBClient:
         conn = None
         try:
             conn = self._get_connection()
-            # Switch database if specified
-            if db and db != self.default_database:
-                cursor_temp = conn.cursor()
-                try:
-                    cursor_temp.execute(f"USE `{db}`")
-                except (MySQLError, adbcError) as db_err:
-                    return {"error_message":str(db_err)}
-                finally:
-                    cursor_temp.close()
+            use_err = self._apply_session_namespace(conn, db)
+            if use_err is not None and not use_err.success:
+                return {"error_message": use_err.error_message or "USE failed"}
             query_dump_result = self._execute(conn, "select get_query_dump(%s, %s)", (query, False))
             if not query_dump_result.success:
                 return {"error_message":query_dump_result.error_message}

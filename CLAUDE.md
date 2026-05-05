@@ -26,6 +26,17 @@ uv run mcp-server-starrocks
 # Install dependencies (handled by uv automatically)
 uv sync
 
+# Install with test extras (pytest); required to run the test suite
+uv sync --extra test
+
+# Run tests (do not use `uv run pytest` alone — pytest is an optional extra)
+uv run --extra test python -m pytest tests/ -v
+
+# Integration tests only (real StarRocks: set STARROCKS_URL or host/port; unset STARROCKS_DUMMY_TEST)
+# uv run --extra test python -m pytest tests/test_db_client.py -v -m integration
+# CI: STARROCKS_INTEGRATION_STRICT=1 fails the job if FE is unreachable instead of skipping
+# Read-only FE account: STARROCKS_INTEGRATION_READ_ONLY=1 skips DDL integration tests; or: -m "integration and read_only"
+
 # Build package
 uv build
 ```
@@ -53,11 +64,15 @@ Connection management uses a global singleton pattern with automatic reconnectio
    - `analyze_query`: Query performance analysis via EXPLAIN ANALYZE
 
 2. **Overview Tools with Caching**:
-   - `table_overview`: Get table schema, row count, and sample data (cached)
+   - `table_overview`: Get table schema, row count, and sample data (cached); supports `catalog.database.table`
    - `db_overview`: Get overview of all tables in a database (uses table cache)
+   - `db_summary` / `catalog_summary`: Database- and catalog-level summaries (`catalog_summary` runs `SHOW DATABASES FROM` then reuses `db_summary` logic)
    
 3. **Visualization Tool**:
    - `query_and_plotly_chart`: Execute query and generate Plotly charts from results
+
+4. **Catalog-wide summary**:
+   - `catalog_summary`: `SHOW DATABASES FROM catalog`, then per-database summaries (same logic as `db_summary`)
 
 ### Resource Endpoints
 
@@ -68,7 +83,7 @@ Connection management uses a global singleton pattern with automatic reconnectio
 
 ### Caching System
 
-In-memory cache for table overviews using `(database_name, table_name)` as cache keys. Cache includes both successful results and error messages. Controlled by `STARROCKS_OVERVIEW_LIMIT` environment variable (default: 20000 characters).
+In-memory cache for table overviews using `(catalog, database, table)` cache keys (`catalog` may be empty for single-catalog `database.table` references). Cache includes both successful results and error messages. Controlled by `STARROCKS_OVERVIEW_LIMIT` environment variable (default: 20000 characters).
 
 ## Configuration
 
@@ -77,7 +92,8 @@ Environment variables for database connection:
 - `STARROCKS_PORT`: MySQL port (default: 9030)  
 - `STARROCKS_USER`: Username (default: root)
 - `STARROCKS_PASSWORD`: Password (default: empty)
-- `STARROCKS_DB`: Default database for session
+- `STARROCKS_DB`: Default session namespace for `USE`: `database` or `catalog.database`
+- `STARROCKS_CATALOG`: Optional; combined with `STARROCKS_DB` when `STARROCKS_DB` has no dot (same as setting `STARROCKS_DB` to `catalog.database`). When `STARROCKS_URL` is set, applies the same merge if the URL path database has no dot.
 - `STARROCKS_MYSQL_AUTH_PLUGIN`: Auth plugin (e.g., mysql_clear_password)
 - `STARROCKS_FE_ARROW_FLIGHT_SQL_PORT`: Enables Arrow Flight SQL mode
 - `MCP_TRANSPORT_MODE`: Communication mode (stdio/streamable-http/sse)
