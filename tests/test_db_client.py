@@ -28,12 +28,27 @@ from src.mcp_server_starrocks.db_client import (
     parse_connection_url,
     _safe_json_value,
     MAX_SAFE_INTEGER,
+    format_use_statement,
+    format_qualified_identifiers,
 )
 from src.mcp_server_starrocks.secret_resolver import SecretResolutionError
 
 
 class TestDBClient:
     """Test cases for DBClient class."""
+
+    def test_starrocks_catalog_merges_with_db(self, monkeypatch):
+        """STARROCKS_CATALOG + STARROCKS_DB without dot becomes catalog.database default."""
+        monkeypatch.delenv("STARROCKS_URL", raising=False)
+        monkeypatch.setenv("STARROCKS_CATALOG", "jdbc_cat")
+        monkeypatch.setenv("STARROCKS_DB", "app_data")
+        monkeypatch.setenv("STARROCKS_HOST", "localhost")
+        monkeypatch.setenv("STARROCKS_PORT", "9030")
+        monkeypatch.setenv("STARROCKS_USER", "root")
+        monkeypatch.setenv("STARROCKS_PASSWORD", "")
+        reset_db_connections()
+        client = DBClient()
+        assert client.default_database == "jdbc_cat.app_data"
     
     @pytest.fixture
     def db_client(self):
@@ -55,6 +70,8 @@ class TestDBClient:
         client2 = get_db_client()
         assert client1 is client2
     
+    @pytest.mark.integration
+    @pytest.mark.read_only
     def test_execute_show_databases(self, db_client):
         """Test executing SHOW DATABASES query."""
         result = db_client.execute("SHOW DATABASES")
@@ -72,6 +89,8 @@ class TestDBClient:
         database_names = [row[0] for row in result.rows]
         assert 'information_schema' in database_names
     
+    @pytest.mark.integration
+    @pytest.mark.read_only
     def test_execute_show_databases_pandas(self, db_client):
         """Test executing SHOW DATABASES with pandas return format."""
         result = db_client.execute("SHOW DATABASES", return_format="pandas")
@@ -87,6 +106,8 @@ class TestDBClient:
         df = result.to_pandas()
         assert df is result.pandas
     
+    @pytest.mark.integration
+    @pytest.mark.read_only
     def test_execute_invalid_query(self, db_client):
         """Test executing an invalid SQL query."""
         result = db_client.execute("SELECT * FROM nonexistent_table_12345")
@@ -97,6 +118,8 @@ class TestDBClient:
         assert "nonexistent_table_12345" in result.error_message or "doesn't exist" in result.error_message.lower()
         assert result.execution_time is not None
     
+    @pytest.mark.integration
+    @pytest.mark.integration_mutating
     def test_execute_create_and_drop_database(self, db_client):
         """Test creating and dropping a test database."""
         test_db_name = "test_mcp_db_client"
@@ -123,6 +146,8 @@ class TestDBClient:
         database_names = [row[0] for row in show_result.rows]
         assert test_db_name not in database_names
     
+    @pytest.mark.integration
+    @pytest.mark.read_only
     def test_execute_with_specific_database(self, db_client):
         """Test executing query with specific database context."""
         # Use information_schema which should always be available
@@ -139,6 +164,8 @@ class TestDBClient:
         found_expected = any(table in table_names for table in expected_tables)
         assert found_expected, f"Expected at least one of {expected_tables} in {table_names}"
     
+    @pytest.mark.integration
+    @pytest.mark.read_only
     def test_execute_with_invalid_database(self, db_client):
         """Test executing query with non-existent database."""
         result = db_client.execute("SHOW TABLES", db="nonexistent_db_12345")
@@ -147,6 +174,8 @@ class TestDBClient:
         assert result.error_message is not None
         assert "nonexistent_db_12345" in result.error_message
     
+    @pytest.mark.integration
+    @pytest.mark.integration_mutating
     def test_execute_table_operations(self, db_client):
         """Test creating, inserting, querying, and dropping a table."""
         test_db = "test_mcp_table_ops"
@@ -205,6 +234,8 @@ class TestDBClient:
             # Clean up
             db_client.execute(f"DROP DATABASE IF EXISTS {test_db}")
     
+    @pytest.mark.integration
+    @pytest.mark.integration_mutating
     def test_execute_pandas_format_with_data(self, db_client):
         """Test pandas format with actual data."""
         test_db = "test_mcp_pandas"
@@ -247,6 +278,7 @@ class TestDBClient:
         finally:
             db_client.execute(f"DROP DATABASE IF EXISTS {test_db}")
     
+    @pytest.mark.integration
     def test_connection_error_handling(self, db_client):
         """Test error handling when connection fails."""
         # Mock a connection failure
@@ -257,6 +289,8 @@ class TestDBClient:
             assert "Connection failed" in result.error_message
             assert result.execution_time is not None
     
+    @pytest.mark.integration
+    @pytest.mark.read_only
     def test_reset_connections(self, db_client):
         """Test connection reset functionality."""
         # First execute a query to establish connection
@@ -270,6 +304,8 @@ class TestDBClient:
         result2 = db_client.execute("SHOW DATABASES")
         assert result2.success is True
     
+    @pytest.mark.integration
+    @pytest.mark.integration_mutating
     def test_describe_table(self, db_client):
         """Test DESCRIBE table functionality."""
         test_db = "test_mcp_describe"
@@ -529,9 +565,10 @@ class TestResultSet:
             'id,name,value',
             '1,test1,10.5',
             '2,test2,20.5',
-            ''
+            'Total rows: 2',
+            'Execution time: 0.100s',
         ]
-        assert string_output == '\n'.join(expected_lines)
+        assert string_output == '\n'.join(expected_lines) + '\n'
     
     def test_result_set_to_string_with_limit(self):
         """Test ResultSet to_string with limit."""
@@ -546,8 +583,8 @@ class TestResultSet:
         string_output = result.to_string(limit=20)
         lines = string_output.split('\n')
         assert lines[0] == 'id,name'  # Header should always be included
-        # Should stop before all rows due to limit
-        assert len(lines) < 4  # Should be less than header + 2 rows + empty line
+        assert '...' in string_output  # Truncation marker when limit is tight
+        assert any(line.startswith('Total rows:') for line in lines)
     
     def test_result_set_to_string_error_cases(self):
         """Test ResultSet to_string error handling."""
@@ -747,6 +784,30 @@ class TestSafeJsonValue:
         assert isinstance(result.rows[0][1], int)
 
 
+class TestFormatUseStatement:
+    def test_single_segment(self):
+        assert format_use_statement("mydb") == "USE `mydb`"
+
+    def test_catalog_database(self):
+        assert format_use_statement("hive.sales") == "USE `hive`.`sales`"
+
+    def test_invalid_empty(self):
+        with pytest.raises(ValueError):
+            format_use_statement("")
+
+    def test_invalid_segment(self):
+        with pytest.raises(ValueError):
+            format_use_statement("bad name")
+
+
+class TestFormatQualifiedIdentifiers:
+    def test_two_parts(self):
+        assert format_qualified_identifiers("a.b") == "`a`.`b`"
+
+    def test_one_part(self):
+        assert format_qualified_identifiers("db0") == "`db0`"
+
+
 class TestParseConnectionUrl:
     """Test cases for parse_connection_url function."""
     
@@ -763,6 +824,12 @@ class TestParseConnectionUrl:
             'database': 'test_db'
         }
         assert result == expected
+
+    def test_parse_url_dotted_database_path(self):
+        url = "root:secret@fe.example.com:9030/jdbc_cat.app_db"
+        result = parse_connection_url(url)
+        assert result["database"] == "jdbc_cat.app_db"
+        assert result["host"] == "fe.example.com"
     
     def test_parse_url_with_schema(self):
         """Test parsing connection URL with schema."""
@@ -1341,11 +1408,12 @@ class TestDummyMode:
             expected_lines = [
                 'name',
                 'aaa',
-                'bbb', 
+                'bbb',
                 'ccc',
-                ''
+                'Total rows: 3',
+                'Execution time: 0.100s',
             ]
-            assert string_output == '\n'.join(expected_lines)
+            assert string_output == '\n'.join(expected_lines) + '\n'
 
 
 if __name__ == "__main__":

@@ -179,16 +179,18 @@ You can configure StarRocks connection using either individual environment varia
 - `STARROCKS_PASSWORD`: (Optional) StarRocks password. Defaults to empty string.
 - `STARROCKS_PASSWORD_KEYCHAIN_SERVICE`: (Optional, macOS only) Generic password service name to use when reading the password from Keychain. This is only used when no explicit password is provided via `STARROCKS_PASSWORD` or `STARROCKS_URL`.
 - `STARROCKS_PASSWORD_KEYCHAIN_ACCOUNT`: (Optional, macOS only) Generic password account name to use when reading the password from Keychain. Defaults to the resolved StarRocks user.
-- `STARROCKS_DB`: (Optional) Default database to use if not specified in tool arguments or resource URIs. If set, the connection will attempt to `USE` this database. Tools like `table_overview` and `db_overview` will use this if the database part is omitted in their arguments. Defaults to empty (no default database).
+- `STARROCKS_DB`: (Optional) Default **session namespace** for StarRocks `USE`: either a single database name (`mydb`) or a two-part name `catalog.database` (for example an external JDBC or Paimon catalog). Tools use this when the `db` argument is omitted. Defaults to empty (no default namespace).
+- `STARROCKS_CATALOG`: (Optional) When set together with `STARROCKS_DB` **and** `STARROCKS_DB` does not already contain a dot, the server builds the default namespace as `STARROCKS_CATALOG` + `.` + `STARROCKS_DB` (same as writing `STARROCKS_DB=catalog.database`). Ignored when `STARROCKS_URL` is set unless the URL path supplies only a single-segment database name and you also set `STARROCKS_CATALOG`, in which case they are combined the same way.
 
 **Option 2: Connection URL (takes precedence over individual variables)**
 
-- `STARROCKS_URL`: (Optional) A connection URL string that contains all connection parameters in a single variable. Format: `[<schema>://]user:password@host:port/database`. The schema part is optional. When this variable is set, it takes precedence over the individual `STARROCKS_HOST`, `STARROCKS_PORT`, `STARROCKS_USER`, `STARROCKS_PASSWORD`, and `STARROCKS_DB` variables.
+- `STARROCKS_URL`: (Optional) A connection URL string that contains all connection parameters in a single variable. Format: `[<schema>://]user:password@host:port/database`. The optional `database` path segment may contain a dot (`catalog.database`) for the default session namespace. The schema part is optional. When this variable is set, it takes precedence over the individual `STARROCKS_HOST`, `STARROCKS_PORT`, `STARROCKS_USER`, `STARROCKS_PASSWORD`, and `STARROCKS_DB` variables.
 
   Examples:
   - `root:mypass@localhost:9030/test_db`
   - `mysql://admin:secret@db.example.com:9030/production`  
   - `starrocks://user:pass@192.168.1.100:9030/analytics`
+  - `root:pw@fe:9030/jdbc_catalog.app_db` (default `USE jdbc_catalog.app_db`)
 
 Password precedence:
 - A password embedded in `STARROCKS_URL` wins, including an explicit empty password like `user:@host:9030/db`.
@@ -230,7 +232,59 @@ export STARROCKS_PASSWORD_KEYCHAIN_ACCOUNT=root
   - `streamable-http` (Streamable HTTP): Starts as a Streamable HTTP Server, supporting RESTful API calls.
   - `sse`: **(Deprecated, not recommended)** Starts in Server-Sent Events (SSE) streaming mode, suitable for scenarios requiring streaming responses. **Note: SSE mode is no longer maintained, it is recommended to use Streamable HTTP mode uniformly.**
 
+## Testing
+
+Install dev dependencies and run the full suite (unit tests + skipped integration if no cluster):
+
+```bash
+uv sync --extra test
+uv run --extra test python -m pytest tests/ -v
+```
+
+### Testing with a real StarRocks cluster
+
+Integration tests are marked with `@pytest.mark.integration` and call `SHOW DATABASES` against the same connection settings as the server (`STARROCKS_URL`, or `STARROCKS_HOST` / `STARROCKS_PORT` / `STARROCKS_USER` / `STARROCKS_PASSWORD`). **Unset** `STARROCKS_DUMMY_TEST` so the client does not short-circuit.
+
+Run **only** integration tests:
+
+```bash
+unset STARROCKS_DUMMY_TEST
+export STARROCKS_URL='user:password@fe-host:9030'   # or use STARROCKS_HOST / STARROCKS_PORT / ...
+uv run --extra test python -m pytest tests/test_db_client.py -v -m integration --tb=short
+```
+
+Read-only subset (no `CREATE`/`DROP`/`INSERT` in tests — safe against production-style clusters):
+
+```bash
+unset STARROCKS_DUMMY_TEST
+export STARROCKS_URL='user:password@fe-host:9030'
+uv run --extra test python -m pytest tests/test_db_client.py -v -m "integration and read_only" --tb=short
+```
+
+Accounts that can connect but **lack DDL** (e.g. catalog-scoped read-only roles): still run the full test file, but skip mutating integration tests:
+
+```bash
+unset STARROCKS_DUMMY_TEST
+export STARROCKS_URL='user:password@fe-host:9030'
+export STARROCKS_INTEGRATION_READ_ONLY=1
+uv run --extra test python -m pytest tests/test_db_client.py -v -m integration --tb=short
+```
+
+- If the FE is **not** reachable, those tests are **skipped** by default.
+- Set **`STARROCKS_INTEGRATION_STRICT=1`** to **fail** the run when the cluster is unreachable (useful in CI when you expect a real FE to be available).
+
 ## Components
+
+### Multi-catalog metadata discovery
+
+For clusters with several catalogs (JDBC, Paimon, `default_catalog`, etc.):
+
+1. `read_query('SHOW CATALOGS')` — list catalog names.
+2. `catalog_summary(catalog='...')` — for one catalog, list its databases and run a `db_summary`-style report for each (capped by `max_databases` to avoid huge responses).
+3. `db_summary(db='catalog.database')` — drill into a single database when you need more detail or a smaller payload.
+4. `table_overview` with `catalog.database.table` — single-table overview.
+
+Fully qualified table names in SQL should use `` `catalog`.`database`.`table` `` (or rely on `USE catalog.database` via the `db` tool argument / `STARROCKS_DB`).
 
 ### Tools
 
@@ -241,7 +295,7 @@ export STARROCKS_PASSWORD_KEYCHAIN_ACCOUNT=root
     ```json
     {
       "query": "SQL query string",
-      "db": "database name (optional, uses default database if not specified)",
+      "db": "optional session namespace: database or catalog.database (StarRocks USE; overrides per-session default and STARROCKS_DB)",
       "output_file": "optional path; if set, writes the full result to disk and returns only a summary + small preview. Relative paths resolve against STARROCKS_MCP_OUTPUT_DIR (default: ~/.mcp-server-starrocks/output/); absolute paths and ~ are used as-is",
       "output_format": "optional: csv | tsv | json | jsonl. If omitted, inferred from output_file extension (.csv/.tsv/.json/.jsonl/.ndjson); defaults to csv"
     }
@@ -255,7 +309,7 @@ export STARROCKS_PASSWORD_KEYCHAIN_ACCOUNT=root
     ```json
     {
       "query": "SQL command string",
-      "db": "database name (optional, uses default database if not specified)"
+      "db": "optional session namespace: database or catalog.database"
     }
     ```
   - **Output:** Text content confirming success (e.g., "Query OK, X rows affected") or reporting an error. Changes are committed automatically on success.
@@ -268,7 +322,7 @@ export STARROCKS_PASSWORD_KEYCHAIN_ACCOUNT=root
     {
       "uuid": "Query ID, a string composed of 32 hexadecimal digits formatted as 8-4-4-4-12",
       "sql": "Query SQL to analyze",
-      "db": "database name (optional, uses default database if not specified)"
+      "db": "optional session namespace: database or catalog.database"
     }
     ```
   - **Output:** Text content containing the query analysis results. Uses `ANALYZE PROFILE FROM` if uuid is provided, otherwise uses `EXPLAIN ANALYZE` if sql is provided.
@@ -281,7 +335,7 @@ export STARROCKS_PASSWORD_KEYCHAIN_ACCOUNT=root
     {
       "query": "SQL query to fetch data",
       "plotly_expr": "Python expression string using 'px' (Plotly Express) and 'df' (DataFrame). Example: 'px.scatter(df, x=\"col1\", y=\"col2\")'",
-      "db": "database name (optional, uses default database if not specified)"
+      "db": "optional session namespace: database or catalog.database"
     }
     ```
   - **Output:** A list containing:
@@ -294,11 +348,21 @@ export STARROCKS_PASSWORD_KEYCHAIN_ACCOUNT=root
   - **Input:**
     ```json
     {
-      "table": "Table name, optionally prefixed with database name (e.g., 'db_name.table_name' or 'table_name'). If database is omitted, uses STARROCKS_DB environment variable if set.",
+      "table": "`table`, `database.table`, or `catalog.database.table`. If only `table` is given, set STARROCKS_DB to `database` or `catalog.database`.",
       "refresh": false // Optional, boolean. Set to true to bypass the cache. Defaults to false.
     }
     ```
   - **Output:** Text content containing the formatted overview (columns, row count, sample data) or an error message. Cached results include previous errors if applicable.
+
+- `db_summary`
+
+  - **Description:** Summarize one database (table list with sizes, columns, optional `SHOW CREATE` for large tables). Same engine as the per-database sections inside `catalog_summary`.
+  - **Input:** `db` (optional): `database` or `catalog.database`; `limit` (output size); `refresh`.
+
+- `catalog_summary`
+
+  - **Description:** Run `SHOW DATABASES FROM catalog`, then `db_summary` for each database as `catalog.database` (best-effort; per-database errors are inlined). Use `max_databases` to limit breadth.
+  - **Input:** `catalog` (optional if `STARROCKS_CATALOG` or `STARROCKS_DB=catalog.database` is set), `limit_per_database`, `max_databases`, `refresh`.
 
 - `db_overview`
   - **Description:** Get an overview (columns, row count, sample rows) for _all_ tables within a specified database. Uses the table-level cache for each table unless `refresh` is true.
