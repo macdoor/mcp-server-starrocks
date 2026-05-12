@@ -589,18 +589,20 @@ def query_and_plotly_chart(
 @mcp.tool(description="Get an overview of a specific table: columns, sample rows (up to 3), and total row count. Uses cache unless refresh=true" + description_suffix)
 def table_overview(
         table: Annotated[str, Field(
-            description="Table: `table`, `database.table`, or `catalog.database.table`. Single name requires session default STARROCKS_DB=`catalog.database` or `database`. Prefer fully qualified three-part names in multi-catalog clusters.")],
+            description="Table: `table`, `database.table`, or `catalog.database.table`. Single name requires session default (via `db` arg, `set_session_db`, or STARROCKS_DB=`catalog.database`/`database`). Prefer fully qualified three-part names in multi-catalog clusters.")],
+        db: Annotated[str | None, Field(
+            description="Optional session namespace for a single-segment `table`: `database` or `catalog.database`. Ignored when `table` already contains dots. Overrides per-session default and STARROCKS_DB.")] = None,
         refresh: Annotated[
             bool, Field(description="Set to true to force refresh, ignoring cache. Defaults to false.")] = False,
         ctx: Context = None,
 ) -> str:
     try:
-        logger.info(f"Getting table overview for: {table}, refresh={refresh}")
+        logger.info(f"Getting table overview for: {table}, db={db}, refresh={refresh}")
         if not table:
             logger.error("Table overview called without table name")
             return "Error: Missing 'table' argument."
 
-        session_default = db_client.get_session_default_db(_safe_session_id(ctx))
+        session_default = db if db else db_client.get_session_default_db(_safe_session_id(ctx))
         catalog, database, table_name, last = _parse_table_overview_arg(table, session_default)
         if database is None or table_name is None:
             return last
